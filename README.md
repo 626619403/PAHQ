@@ -1,4 +1,4 @@
-# PAHQ - Quantization Experiment
+# PAHQ
 
 This repository is used to show our pareto curve.
   
