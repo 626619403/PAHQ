@@ -1,0 +1,5 @@
+task: greaterthan
+num_examples: 100
+metric: kl_div
+model: gpt2-small
+description: "Greater-than comparison task on GPT-2 Small"

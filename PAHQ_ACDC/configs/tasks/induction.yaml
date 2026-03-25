@@ -1,0 +1,6 @@
+task: induction
+num_examples: 50
+seq_len: 300
+metric: kl_div
+model: attn-only-4l
+description: "Induction task on attention-only 4-layer model"

@@ -1,0 +1,6 @@
+task: docstring
+num_examples: 50
+seq_len: 41
+metric: kl_div
+model: attn-only-4l
+description: "Docstring completion task"

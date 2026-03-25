@@ -25,17 +25,19 @@
 # SIXTEEN_HEADS_RUN
 import sys
 import os
-# 指定要添加的路径
-path = os.path.expanduser( "~/autodl-tmp/acdc_q/")
 
-# 将路径添加到 sys.path
-if path not in sys.path:
-    sys.path.append(path)
-path = os.path.expanduser("~/autodl-tmp/acdc_q/subnetwork_probing")
+# Add the PAHQ_ACDC root and subnetwork_probing directories to sys.path so that
+# `acdc`, `subnetwork_probing`, and `transformer_lens` packages are importable
+# regardless of where this script is invoked from.
+_NOTEBOOKS_DIR = os.path.dirname(os.path.abspath(__file__))
+_PAHQ_ACDC_ROOT = os.path.dirname(_NOTEBOOKS_DIR)
+_REPO_ROOT = os.path.dirname(_PAHQ_ACDC_ROOT)
 
-# 将路径添加到 sys.path
-if path not in sys.path:
-    sys.path.append(path)
+for _p in [_PAHQ_ACDC_ROOT,
+           os.path.join(_PAHQ_ACDC_ROOT, "subnetwork_probing"),
+           os.path.join(_REPO_ROOT, "transformer_lens")]:
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 import collections
 import IPython
 

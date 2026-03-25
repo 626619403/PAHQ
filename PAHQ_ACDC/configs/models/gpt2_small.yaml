@@ -1,0 +1,9 @@
+name: gpt2-small
+n_layers: 12
+n_heads: 12
+d_model: 768
+d_head: 64
+d_mlp: 3072
+d_vocab: 50257
+n_ctx: 1024
+description: "OpenAI GPT-2 Small (117M parameters)"

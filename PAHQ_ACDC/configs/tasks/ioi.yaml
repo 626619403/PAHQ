@@ -1,0 +1,5 @@
+task: ioi
+num_examples: 50
+metric: kl_div
+model: gpt2-small
+description: "Indirect Object Identification (IOI) task on GPT-2 Small"

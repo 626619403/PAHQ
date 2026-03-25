@@ -1,0 +1,7 @@
+name: attn-only-4l
+n_layers: 4
+n_heads: 8
+d_model: 256
+d_head: 32
+d_mlp: null
+description: "Attention-only 4-layer model (no MLP layers)"

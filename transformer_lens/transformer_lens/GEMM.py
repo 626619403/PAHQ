@@ -1,21 +1,43 @@
 import argparse
 
 import torch
-import triton
-import triton.language as tl
-import triton.tools.experimental_descriptor
-import triton.profiler as proton
 from contextlib import contextmanager
 
-if torch.cuda.is_available():
-    from triton._C.libtriton import nvidia
-    cublas_workspace = torch.empty(32 * 1024 * 1024, device="cuda", dtype=torch.uint8)
-    cublas = nvidia.cublas.CublasLt(cublas_workspace)
+# Triton is only available when a CUDA GPU is present.
+# Wrap all triton imports so the module can be imported on CPU-only machines.
+try:
+    import triton
+    import triton.language as tl
+    import triton.tools.experimental_descriptor
+    import triton.profiler as proton
+    _TRITON_AVAILABLE = True
+except ImportError:
+    _TRITON_AVAILABLE = False
+    # Provide stub so references to `proton` in bench/validate functions don't crash
+    class _ProtonStub:
+        def start(self, *a, **kw): pass
+        def finalize(self, *a, **kw): pass
+        def activate(self, *a, **kw): pass
+        def deactivate(self, *a, **kw): pass
+        def scope(self, *a, **kw):
+            from contextlib import nullcontext
+            return nullcontext()
+    proton = _ProtonStub()  # type: ignore
+
+if torch.cuda.is_available() and _TRITON_AVAILABLE:
+    try:
+        from triton._C.libtriton import nvidia
+        cublas_workspace = torch.empty(32 * 1024 * 1024, device="cuda", dtype=torch.uint8)
+        cublas = nvidia.cublas.CublasLt(cublas_workspace)
+    except Exception:
+        cublas = None
 else:
     cublas = None
 
 
-def is_cuda():
+def is_cuda() -> bool:
+    if not _TRITON_AVAILABLE:
+        return False
     return triton.runtime.driver.active.get_current_target().backend == "cuda"
 
 
@@ -105,7 +127,6 @@ def matmul(a, b):
         }
     }
     # Check constraints.
-    # 检查约束条件
     assert a.shape[1] == b.shape[0], "Incompatible dimensions"
     assert a.dtype == b.dtype, "Incompatible dtypes"
     M, K = a.shape
@@ -114,7 +135,6 @@ def matmul(a, b):
 
     c = torch.empty((M, N), device=a.device, dtype=dtype)
     # 1D launch kernel where each block gets its own program.
-    # 1 维启动内核，每个线程块获取自己的程序。
     grid = lambda META: (triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]), )
     matmul_kernel[grid](
         a, b, c,  #
@@ -218,7 +238,6 @@ def matmul_persistent(a, b):
         }
     }
     # Check constraints.
-    # 检查限制条件。
     assert a.shape[1] == b.shape[0], "Incompatible dimensions"
     assert a.dtype == b.dtype, "Incompatible dtypes"
     NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
@@ -226,10 +245,8 @@ def matmul_persistent(a, b):
     K, N = b.shape
     dtype = a.dtype
     # Allocates output.
-    # 分配输出空间。
     c = torch.empty((M, N), device=a.device, dtype=dtype)
     # 1D launch kernel where each block gets its own program.
-    # 1 维启动内核，每个线程块获取自己的程序。
     grid = lambda META: (min(NUM_SMS, triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"])), )
     matmul_kernel_persistent[grid](
         a, b, c,  #
@@ -308,7 +325,6 @@ def matmul_kernel_tma_persistent(a_desc_ptr, b_desc_ptr, c_desc_ptr,  #
 
 def matmul_tma_persistent(a, b):
     # Autotuner does not work with TMA. Use manual config.
-    # 自动调优器与TMA不兼容。请使用手动配置。
     configs = {
         torch.float8_e4m3fn: {
             "BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 256, "BLOCK_SIZE_K": 128, "GROUP_SIZE_M": 8, "num_stages": 4,
@@ -320,7 +336,6 @@ def matmul_tma_persistent(a, b):
     }
 
     # Check constraints.
-    # 检查约束条件。
     assert a.shape[1] == b.shape[1], "Incompatible dimensions"  # b is transposed
     assert a.dtype == b.dtype, "Incompatible dtypes"
 
@@ -370,7 +385,6 @@ def matmul_kernel_device_tma_persistent(workspace_ptr,  #
                                         GROUP_SIZE_M: tl.constexpr,  #
                                         NUM_SMS: tl.constexpr):  #
     # Matmul using TMA and device-side descriptor creation
-    # 使用 TMA 和设备端描述符创建的矩阵乘法。
     dtype = c_ptr.dtype.element_ty
     start_pid = tl.program_id(axis=0)
     num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
@@ -420,7 +434,6 @@ def matmul_kernel_device_tma_persistent(workspace_ptr,  #
             ni += 1
 
             # Simulate a grouped gemm
-            # 模拟一个分组的GEMM (General Matrix Multiply) 操作。
             if ni == tiles_per_update:
                 tl.extra.cuda.experimental_device_tensormap_create2d(desc_ptr=a_desc_ptr, global_address=a_ptr,
                                                                      load_size=[BLOCK_SIZE_M,
@@ -465,7 +478,6 @@ def matmul_kernel_device_tma_persistent(workspace_ptr,  #
 
 def matmul_device_tma_persistent(a, b, tiles_per_update):
     # Autotuner does not work with TMA. Use manual config.
-    # 自动调优器与 TMA 不兼容。请使用手动配置。
     configs = {
         torch.float8_e4m3fn: {
             "BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 256, "BLOCK_SIZE_K": 128, "GROUP_SIZE_M": 8, "num_stages": 4,
@@ -477,7 +489,6 @@ def matmul_device_tma_persistent(a, b, tiles_per_update):
     }
 
     # Check constraints.
-    # 检查约束条件。
     assert a.shape[1] == b.shape[1], "Incompatible dimensions"  # b is transposed
     assert a.dtype == b.dtype, "Incompatible dtypes"
 
@@ -509,7 +520,6 @@ def matmul_device_tma_persistent(a, b, tiles_per_update):
 
 def cublas_matmul(a, b):
     # Check constraints.
-    # 检查约束条件。
     assert a.shape[1] == b.shape[1], "Incompatible dimensions"  # b is transposed
     M, K = a.shape
     N, K = b.shape
@@ -551,13 +561,17 @@ def bench_fn(reps, warmup_reps, fn, *args):
             fn(*args)
             
 def fp8_matmul(a, b, tiles_per_update):
+    """FP8 matrix multiplication. Falls back to float32 torch.matmul on CPU or when Triton is unavailable."""
+    if not torch.cuda.is_available() or not _TRITON_AVAILABLE:
+        # CPU fallback: cast to float32 and use standard matmul
+        return torch.matmul(a.to(torch.float32), b.to(torch.float32))
 
     capability = torch.cuda.get_device_capability()
-    is_hopper = capability[0] == 9 
-    
+    is_hopper = capability[0] == 9
+
     if is_hopper:
-        return matmul_device_tma_persistent(a, b.T , tiles_per_update)
-    
+        return matmul_device_tma_persistent(a, b.T, tiles_per_update)
+
     return matmul_persistent(a, b)
     
     

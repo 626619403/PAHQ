@@ -1,0 +1,7 @@
+name: attn-only-2l
+n_layers: 2
+n_heads: 8
+d_model: 256
+d_head: 32
+d_mlp: null
+description: "Attention-only 2-layer model (Redwood Research)"

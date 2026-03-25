@@ -13,16 +13,20 @@ from transformer_lens.hook_points import HookPoint
 from transformer_lens.HookedTransformerConfig import HookedTransformerConfig
 from transformer_lens.past_key_value_caching import HookedTransformerKeyValueCacheEntry
 from torch import float16,float32
-#from transformer_engine.pytorch import fp8_autocast, fp8_quantize_dequantize
-#import transformer_engine.pytorch as te
-#from transformer_engine.common.recipe import Format
 from transformer_lens.utils import (
     gelu_fast,
     gelu_new,
     get_causal_mask_for_left_padding,
     solu,
 )
-from transformer_lens.GEMM import matmul_device_tma_persistent,fp8_matmul
+try:
+    from transformer_lens.GEMM import matmul_device_tma_persistent, fp8_matmul
+except ImportError:
+    # CPU-only fallback: simple float32 matmul
+    def fp8_matmul(a, b, tiles_per_update=None):  # type: ignore[misc]
+        return torch.matmul(a.to(torch.float32), b.to(torch.float32))
+    def matmul_device_tma_persistent(a, b, tiles_per_update=None):  # type: ignore[misc]
+        return torch.matmul(a.to(torch.float32), b.to(torch.float32))
 
 class FP8Manager:
     def __init__(self, max_val=448.0):
@@ -434,7 +438,16 @@ class Attention(nn.Module):
         self.register_parameter('b_V', nn.Parameter(torch.zeros(cfg.n_heads, cfg.d_head), requires_grad=False))
         self.register_parameter('b_O', nn.Parameter(torch.zeros(cfg.d_model), requires_grad=False))
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        
+
+        # CUDA streams for overlapped computation/transfer.
+        # Created once here (not per forward call) to avoid per-call allocation overhead.
+        if torch.cuda.is_available():
+            self.stream_load = torch.cuda.Stream()   # S_load: async CPU→GPU weight transfer
+            self.stream_high = torch.cuda.Stream()   # S_high: FP32 high-precision compute
+        else:
+            self.stream_load = None
+            self.stream_high = None
+
         # Hooks
         self.hook_q = HookPoint()
         self.hook_k = HookPoint()
@@ -512,79 +525,72 @@ class Attention(nn.Module):
 
         # Determine einsum string format based on whether QKV inputs are split.
         try:
-            x=self.W_Q_low
+            x = self.W_Q_low
         except AttributeError:
             self.update_W_low()
-        stream_load_weights = torch.cuda.Stream()  # 用于加载高精度权重
-        stream_compute_high = torch.cuda.Stream()
+        # Use pre-allocated instance streams (created in __init__) rather than allocating
+        # new stream objects on every forward call.
+        stream_load_weights = self.stream_load
+        stream_compute_high = self.stream_high
         if self.cfg.use_split_qkv_input:
             query_input = query_input[:, :, 0, :].squeeze(2)
             key_input   = key_input[:, :, 0, :].squeeze(2)
             value_input = value_input[:, :, 0, :].squeeze(2)
             
-        if selected_head!=-1:
-            with torch.cuda.stream(stream_load_weights):
-                W_Q_high, W_K_high,W_V_high= self.load_high_precision_weights(selected_head)
+        if selected_head != -1:
+            if stream_load_weights is not None:
+                with torch.cuda.stream(stream_load_weights):
+                    W_Q_high, W_K_high, W_V_high = self.load_high_precision_weights(selected_head)
+            else:
+                W_Q_high, W_K_high, W_V_high = self.load_high_precision_weights(selected_head)
             
             # Input shape: [batch, pos, d_model]
             # Directly compute high-precision results with output shape [batch, pos, d_head],
             # then unsqueeze to obtain shape [batch, n_heads, pos, d_head].
  
-        query_flat = query_input.to(torch.float8_e4m3fn)  
-        # 普通矩阵乘法: [batch*pos, d_model] @ [d_model, n_heads*d_head]
-        
-        '''q_low_flat = matmul_device_tma_persistent(
-            query_flat.view(-1, self.cfg.d_model),
-            self.W_Q_low.view(self.cfg.d_model, -1),
-            4
-        ) # [batch*pos, n_heads, d_head]'''
+        query_flat = query_input.to(torch.float8_e4m3fn)
+        # Matmul: [batch*pos, d_model] @ [d_model, n_heads*d_head]
         q_low_flat = fp8_matmul(
             query_flat.view(-1, self.cfg.d_model),
             self.W_Q_low.view(self.cfg.d_model, -1),
             4
         ) # [batch*pos, n_heads, d_head]
-        if selected_head!=-1:
-            stream_load_weights.synchronize()
-            with torch.cuda.stream(stream_compute_high):
-                q_high,k_high,v_high=self.compute_high_precision_results(
-                    query_input,key_input,value_input,
-                    W_Q_high,W_K_high,W_V_high)
+        if selected_head != -1:
+            if stream_load_weights is not None:
+                stream_load_weights.synchronize()
+            if stream_compute_high is not None:
+                with torch.cuda.stream(stream_compute_high):
+                    q_high, k_high, v_high = self.compute_high_precision_results(
+                        query_input, key_input, value_input,
+                        W_Q_high, W_K_high, W_V_high)
+            else:
+                q_high, k_high, v_high = self.compute_high_precision_results(
+                    query_input, key_input, value_input,
+                    W_Q_high, W_K_high, W_V_high)
         # Restore shape to [batch, pos, n_heads, d_head] and then permute to [batch, n_heads, pos, d_head]
         q_low = q_low_flat.view(query_input.size(0), query_input.size(1),
                                 self.cfg.n_heads, self.cfg.d_head).permute(0, 2, 1, 3)
 
-        key_flat = key_input.to(torch.float8_e4m3fn)   
-        '''k_low_flat = matmul_device_tma_persistent(
-            key_flat.view(-1, self.cfg.d_model),  # [batch*pos, d_model]
-            self.W_K_low.view(self.cfg.d_model, -1) ,
-            4
-        )  # [batch*pos, n_heads, d_head]'''
+        key_flat = key_input.to(torch.float8_e4m3fn)
         k_low_flat = fp8_matmul(
             key_flat.view(-1, self.cfg.d_model),  # [batch*pos, d_model]
             self.W_K_low.view(self.cfg.d_model, -1) ,
             4
         )
-        
 
-        # 恢复形状并 permute
+        # Restore shape and permute
         k_low = k_low_flat.view(key_input.size(0), key_input.size(1),  # [batch, pos, n_heads, d_head]
                                 self.cfg.n_heads, self.cfg.d_head).permute(0, 2, 1, 3)  # [batch, n_heads, pos, d_head]
 
-
-        # Value (V) 的处理
-        value_flat = value_input.to(torch.float8_e4m3fn) 
-        '''v_low_flat = matmul_device_tma_persistent(
-            value_flat.view(-1, self.cfg.d_model),  # [batch*pos, d_model]
-            self.W_V_low.view(self.cfg.d_model, -1),
-            4  
-        )  # [batch*pos, n_heads, d_head]'''
-        v_low_flat =fp8_matmul(
+        # Value (V) computation
+        value_flat = value_input.to(torch.float8_e4m3fn)
+        v_low_flat = fp8_matmul(
             value_flat.view(-1, self.cfg.d_model),  # [batch*pos, d_model]
             self.W_V_low.view(self.cfg.d_model, -1),
             4  
         )  # [batch*pos, n_heads, d_head]
 
-        # 恢复形状并 permute
+        # Restore shape and permute
         v_low = v_low_flat.view(value_input.size(0), value_input.size(1),  # [batch, pos, n_heads, d_head]
                                 self.cfg.n_heads, self.cfg.d_head).permute(0, 2, 1, 3)  # [batch, n_heads, pos, d_head]
 
@@ -593,9 +599,10 @@ class Attention(nn.Module):
         k_low = self.fp8_manager_k.dequantize(k_low, 'W_K')
         v_low = self.fp8_manager_v.dequantize(v_low, 'W_V')
         
-        # Replace the corresponding selected head in the low-precision branch with the high-precision result.
-        stream_compute_high.synchronize()            
-        if selected_head!=-1:  # Here, q_low, k_low, and v_low all have shape [batch, n_heads, pos, d_head].
+        # Synchronize high-precision compute stream before replacing head outputs.
+        if stream_compute_high is not None:
+            stream_compute_high.synchronize()
+        if selected_head != -1:  # q_low, k_low, v_low: [batch, n_heads, pos, d_head]
             q_low[:, selected_head:selected_head+1] = q_high
             k_low[:, selected_head:selected_head+1] = k_high
             v_low[:, selected_head:selected_head+1] = v_high
@@ -658,6 +665,10 @@ class Attention(nn.Module):
             )
         )  # [batch, pos, head_index, d_head]
         if not self.cfg.use_attn_result:
+            # W_O is an nn.Parameter (FP32, on-device) — no explicit high-precision loading
+            # needed. The paper's scheduler description notes W_O is transferred at FP32 because
+            # it is stored on CPU in a pure-CPU-offload setting; in our implementation W_O stays
+            # on GPU as a parameter, so this transfer is already implicit and free.
             out = (
                 (
                     einsum(
